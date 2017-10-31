@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <glib.h>
+#include <openssl/crypto.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <time.h>
@@ -67,11 +68,14 @@ int connect_timeout = 0;
 int read_timeout=0;
 
 gboolean should_escape = 1;
+gboolean vertical = 0;
 gboolean should_not_escape = 0;
+gboolean prepend_keys = 0;
 
 gboolean should_compress = 0;
 
 gboolean tagged_input = 0;
+gboolean timing = 0;
 
 char *ssl_ca = NULL;
 char *ssl_cert = NULL;
@@ -106,6 +110,10 @@ static GOptionEntry entries[] = {
         "Should tabs, newlines and zero bytes be not escaped", NULL},
     {"escape", 'e', 0, G_OPTION_ARG_NONE, &should_escape,
         "Should tabs, newlines and zero bytes be escaped (default)", NULL},
+    {"vertical", 'G', 0, G_OPTION_ARG_NONE, &vertical,
+        "Show line per field", NULL},
+    {"dict", 'D', 0, G_OPTION_ARG_NONE, &prepend_keys,
+        "Prepend field names", NULL},
     {"compress", 'c', 0, G_OPTION_ARG_NONE, &should_compress,
         "Compress server-client communication", NULL},
     {"connect-timeout", 'T', 0, G_OPTION_ARG_INT, &connect_timeout,
@@ -114,10 +122,15 @@ static GOptionEntry entries[] = {
         "Read timeout in seconds", NULL},
     {"tagged", 'x', 0, G_OPTION_ARG_NONE, &tagged_input,
         "Expect tag input column", NULL},
+    {"timing", 'z', 0, G_OPTION_ARG_NONE, &timing,
+        "Report elapsed time for query", NULL},
     {"ssl", 's', 0, G_OPTION_ARG_NONE, &ssl, "Force real ssl", NULL},
-    {"ssl-ca", 0, 0, G_OPTION_ARG_STRING, &ssl_ca, "File with SSL CA info", NULL},
-    {"ssl-key", 0, 0, G_OPTION_ARG_STRING, &ssl_key, "Private key file", NULL},
-    {"ssl-cert", 0, 0, G_OPTION_ARG_STRING, &ssl_cert, "Public key file", NULL},
+    {"ssl-ca", 0, 0, G_OPTION_ARG_STRING, &ssl_ca,
+        "File with SSL CA info", NULL},
+    {"ssl-key", 0, 0, G_OPTION_ARG_STRING, &ssl_key,
+        "Private key file", NULL},
+    {"ssl-cert", 0, 0, G_OPTION_ARG_STRING, &ssl_cert,
+       "Public key file", NULL},
     {NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL}
 };
 
@@ -130,8 +143,28 @@ struct job_entry {
     char *tag;
 };
 
+static pthread_mutex_t *ssl_lockarray;
+static void lock_callback(int mode, int type, const char *file, int line)
+{
+  if (mode & CRYPTO_LOCK)
+    pthread_mutex_lock(&(ssl_lockarray[type]));
+  else
+    pthread_mutex_unlock(&(ssl_lockarray[type]));
+}
 
-struct job_entry * init_job(const char *server, const char *database, const char *query, const char *tag) {
+static void init_openssl_locks(void)
+{
+  ssl_lockarray=(pthread_mutex_t *)g_new0(pthread_mutex_t, CRYPTO_num_locks());
+  for (int i=0; i<CRYPTO_num_locks(); i++)
+    pthread_mutex_init(&(ssl_lockarray[i]),NULL);
+
+  CRYPTO_set_id_callback((unsigned long (*)())pthread_self);
+  CRYPTO_set_locking_callback(lock_callback);
+}
+
+
+struct job_entry * init_job(const char *server, const char *database,
+                            const char *query, const char *tag) {
     struct job_entry *je = g_new0(struct job_entry, 1);
     je->server = strdup(server);
 
@@ -208,15 +241,19 @@ gulong line_escape(char *from, gulong length, char *to)
 }
 
 
-void run_query(char *query, MYSQL *mysql, char *server_name, char *db_name, char *tag) {
+void run_query(char *query, MYSQL *mysql,
+               char *server_name, char *db_name, char *tag) {
     int status;
     int num_fields;
+    gint64 start_time;
 
     MYSQL_RES *res = NULL;
     MYSQL_ROW row = NULL;
 
     GString *rowtext = NULL;
     GString *escaped = NULL;
+
+    char *timing_value = timing ? g_newa(char, 30) : NULL;
 
     if (db_name) {
         if (mysql_select_db(mysql, db_name)) {
@@ -226,6 +263,10 @@ void run_query(char *query, MYSQL *mysql, char *server_name, char *db_name, char
         }
     }
 
+    if (timing) {
+        start_time = g_get_monotonic_time();
+    }
+
     if ((status = mysql_query(mysql, query))) {
         g_warning("Could not execute query on %s: %s",
                   server_name, mysql_error(mysql));
@@ -233,32 +274,86 @@ void run_query(char *query, MYSQL *mysql, char *server_name, char *db_name, char
 
     rowtext = g_string_sized_new(1024);
     escaped = g_string_sized_new(2048);
+
+
     do {
         res = mysql_use_result(mysql);
         if (res) {
             num_fields = mysql_num_fields(res);
+            MYSQL_FIELD * fields = mysql_fetch_fields(res);
 
-            while ((row = mysql_fetch_row(res))) {
-                unsigned long *lengths = mysql_fetch_lengths(res);
-                g_string_printf(rowtext, "%s%s%s%s%s\t",
-                                server_name,
-                                tag ? "\t" : "", tag ? tag : "",
-                                db_name ? "\t" : "", db_name ? db_name : "");
+            if (!vertical) {
+                while ((row = mysql_fetch_row(res))) {
+                    unsigned long *lengths = mysql_fetch_lengths(res);
 
-                for (int i = 0; i < num_fields; i++) {
-                    if (!should_escape || !row[i]) {
-                        g_string_append(rowtext, row[i] ? row[i] : "\\N");
-                        g_string_append(rowtext,
-                            (num_fields - i == 1) ? "\n" : "\t");
-                    } else {
-                        g_string_set_size(escaped, lengths[i] * 2 + 1);
-                        line_escape(row[i], lengths[i], escaped->str);
-                        g_string_append(rowtext, escaped->str);
-                        g_string_append(rowtext,
-                            (num_fields - i == 1) ? "\n" : "\t");
+                    if (timing) {
+                        snprintf(timing_value, 30, "\t%.3f",
+                                 (g_get_monotonic_time() - start_time)
+                                 / 1000000.0);
+                    }
+                    g_string_printf(rowtext, "%s%s%s%s%s%s\t",
+                                    server_name,
+                                    tag ? "\t" : "", tag ? tag : "",
+                                    db_name ? "\t" : "",
+                                    db_name ? db_name : "",
+                                    timing ? timing_value : "");
+
+                    for (int i = 0; i < num_fields; i++) {
+                        if (!should_escape || !row[i]) {
+                            if (prepend_keys) {
+                                g_string_append(rowtext, fields[i].name);
+                                g_string_append(rowtext, ":");
+                            }
+                            g_string_append(rowtext, row[i] ? row[i] : "\\N");
+                            g_string_append(rowtext,
+                                (num_fields - i == 1) ? "\n" : "\t");
+                        } else {
+                            /* TODO: we may want to do this once */
+                            if (prepend_keys) {
+
+                                g_string_set_size(escaped,
+                                    fields[i].name_length * 2 + 1);
+                                line_escape(fields[i].name,
+                                    fields[i].name_length,
+                                    escaped->str);
+
+                                g_string_append(rowtext, escaped->str);
+                                g_string_append(rowtext, ":");
+                            }
+
+                            g_string_set_size(escaped, lengths[i] * 2 + 1);
+                            line_escape(row[i], lengths[i], escaped->str);
+                            g_string_append(rowtext, escaped->str);
+                            g_string_append(rowtext,
+                                (num_fields - i == 1) ? "\n" : "\t");
+                        }
+                    }
+                    write_g_string(STDOUT_FILENO, rowtext);
+                }
+            } else {
+                while ((row = mysql_fetch_row(res))) {
+                    unsigned long *lengths = mysql_fetch_lengths(res);
+                    for (int i = 0; i < num_fields; i++) {
+                        g_string_printf(rowtext, "%s%s%s%s%s\t%s\t",
+                            server_name, tag ? "\t" : "", tag ? tag: "",
+                            db_name ? "\t" : "", db_name ? db_name : "",
+                            fields[i].name);
+
+
+                        if (!row[i]) {
+                            g_string_append(rowtext, "\\N\n");
+                        } else if (!should_escape) {
+                            g_string_append(rowtext, row[i]);
+                            g_string_append(rowtext, "\n");
+                        } else {
+                            g_string_set_size(escaped, lengths[i] * 2 + 1);
+                            line_escape(row[i], lengths[i], escaped->str);
+                            g_string_append(rowtext, escaped->str);
+                            g_string_append(rowtext, "\n");
+                        }
+                        write_g_string(STDOUT_FILENO, rowtext);
                     }
                 }
-                write_g_string(STDOUT_FILENO, rowtext);
             }
 
             if (mysql_errno(mysql))
@@ -300,7 +395,7 @@ static void worker_thread(gpointer data, gpointer user_data)
     int status;
 
     /* "server", "host" and "query" */
-    struct job_entry *je = data;
+    struct job_entry *je = (struct job_entry *)data;
     char *h = strdup(je->server);
     char *host = h;
     char *q = je->query ? je->query : (char *) user_data;
@@ -341,16 +436,19 @@ static void worker_thread(gpointer data, gpointer user_data)
         mysql_options(mysql, MYSQL_OPT_READ_TIMEOUT,
                       (const char *)&read_timeout);
 
+#ifdef MYSQL_OPT_SSL_MODE
     if (ssl)
         ssl_mode = SSL_MODE_VERIFY_IDENTITY;
-    
+
     mysql_options(mysql, MYSQL_OPT_SSL_MODE, &ssl_mode);
+#endif
     mysql_ssl_set(mysql, ssl_key, ssl_cert, ssl_ca, NULL, NULL);
 
     if (!mysql_real_connect(mysql, host, username, password, db,
                             spec_port ? spec_port : port,
                             socket_path, client_flags)) {
-        g_warning("Could not connect to %s: %s", je->server, mysql_error(mysql));
+        g_warning("Could not connect to %s: %s",
+                  je->server, mysql_error(mysql));
         goto cleanup;
     }
 
@@ -507,6 +605,8 @@ int main(int argc, char **argv)
     g_thread_init(NULL);
     MYSQL *mysql = mysql_init(NULL);
     mysql_thread_init();
+
+    init_openssl_locks();
 
     mysql_options(mysql, MYSQL_READ_DEFAULT_GROUP, "pmysql");
     /* This is fake connect to remember various options from my.cnf
