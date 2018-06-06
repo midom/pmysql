@@ -145,7 +145,7 @@ struct job_entry {
 };
 
 static pthread_mutex_t *ssl_lockarray;
-static void lock_callback(int mode, int type, const char *file, int line) {
+void pmysql_lock_callback(int mode, int type, const char *file, int line) {
   int c = 0;
 
   if (file && line)
@@ -157,14 +157,14 @@ static void lock_callback(int mode, int type, const char *file, int line) {
     pthread_mutex_unlock(&(ssl_lockarray[type]));
 }
 
-static void init_openssl_locks(void) {
+void init_openssl_locks(void) {
   ssl_lockarray =
       (pthread_mutex_t *)g_new0(pthread_mutex_t, CRYPTO_num_locks());
   for (int i = 0; i < CRYPTO_num_locks(); i++)
     pthread_mutex_init(&(ssl_lockarray[i]), NULL);
 
   CRYPTO_set_id_callback((unsigned long (*)())pthread_self);
-  CRYPTO_set_locking_callback(lock_callback);
+  CRYPTO_set_locking_callback(pmysql_lock_callback);
 }
 
 struct job_entry *init_job(const char *server, const char *database,
