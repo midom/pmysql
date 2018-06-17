@@ -1,5 +1,5 @@
 /*
-    Copyright 2010 Domas Mituzas, Facebook
+    Copyright 2010-2018 Domas Mituzas, Facebook
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -53,7 +53,7 @@ char **databases = NULL;
 
 gboolean all_databases = FALSE;
 
-char *query = NULL;
+char *the_query = NULL;
 char *queryfile = NULL;
 
 char *serversfile = NULL;
@@ -92,7 +92,7 @@ gboolean ssl = 0;
 gint ssl_mode = 0;
 
 static GOptionEntry entries[] = {
-    {"query", 'Q', 0, G_OPTION_ARG_STRING, &query, "Queries to run", NULL},
+    {"query", 'Q', 0, G_OPTION_ARG_STRING, &the_query, "Queries to run", NULL},
     {"query-file", 'F', 0, G_OPTION_ARG_STRING, &queryfile,
      "File to read queries from", NULL},
     {"servers-file", 'X', 0, G_OPTION_ARG_STRING, &serversfile,
@@ -140,8 +140,17 @@ static GOptionEntry entries[] = {
 struct job_entry {
   char *server;
   char *database;
+  // For fine grained jobs
   char *query;
   char *tag;
+
+  // Derived from server and settings
+  char *host;
+  int port;
+
+  MYSQL *mysql;
+  MYSQL_RES *result;
+  gint64 start_time;
 };
 
 static pthread_mutex_t *ssl_lockarray;
@@ -172,6 +181,36 @@ struct job_entry *init_job(const char *server, const char *database,
   struct job_entry *je = g_new0(struct job_entry, 1);
   je->server = strdup(server);
 
+  /* Extract hostname or IP and port from passed server identifier */
+  char *h = strdup(server);
+  char *host = h;
+
+  char *p;
+  /* Handle [::1] style IPv6 addresses */
+  if (h[0] == '[') {
+    host++;
+    if ((p = strchr(host, ']'))) {
+      *p = 0;
+      p = strchr(++p, ':');
+    }
+  } else {
+    p = strchr(h, ':');
+  }
+
+  if (p) {
+    *p++ = 0;
+    je->port = atoi(p) + port_incr;
+  } else {
+    je->port = port;
+  }
+
+  if (h == host) {
+    je->host = host;
+  } else {
+    je->host = strdup(host);
+    free(h);
+  }
+
   if (database)
     je->database = strdup(database);
   if (query)
@@ -184,12 +223,17 @@ struct job_entry *init_job(const char *server, const char *database,
 
 void free_job(struct job_entry *je) {
   free(je->server);
+  free(je->host);
+
   if (je->database)
     free(je->database);
   if (je->query)
     free(je->query);
   if (je->tag)
     free(je->tag);
+
+  if (je->mysql)
+    mysql_close(je->mysql);
 
   g_free(je);
 }
@@ -242,134 +286,143 @@ gulong line_escape(char *from, gulong length, char *to) {
   return t - to;
 }
 
-void run_query(char *query, MYSQL *mysql, char *server_name, char *db_name,
-               char *tag) {
-  int status;
-  int num_fields;
-  gint64 start_time = 0;
+static inline void g_string_destroy(void *p) { g_string_free(p, TRUE); }
 
-  MYSQL_RES *res = NULL;
-  MYSQL_ROW row = NULL;
+static GPrivate rowtext_key = G_PRIVATE_INIT(g_string_destroy);
+static GPrivate escaped_key = G_PRIVATE_INIT(g_string_destroy);
 
-  GString *rowtext = NULL;
-  GString *escaped = NULL;
+static inline GString *init_private_string(GPrivate *private) {
+  GString *ret = g_private_get(private);
+  if (!ret) {
+    ret = g_string_new(NULL);
+    g_private_set(private, ret);
+  }
+  return ret;
+}
 
+void print_row(struct job_entry *je, MYSQL_ROW row) {
   char *timing_value = timing ? g_newa(char, 30) : NULL;
+  GString *rowtext = init_private_string(&rowtext_key);
+  GString *escaped = init_private_string(&escaped_key);
+  unsigned long *lengths = mysql_fetch_lengths(je->result);
+  MYSQL_FIELD *fields = mysql_fetch_fields(je->result);
 
-  if (db_name) {
-    if (mysql_select_db(mysql, db_name)) {
-      g_warning("Could not select db %s on %s: %s", db_name, server_name,
+  int num_fields = mysql_num_fields(je->result);
+
+  if (timing) {
+    snprintf(timing_value, 30, "\t%.3f",
+             (g_get_monotonic_time() - je->start_time) / 1000000.0);
+  }
+  char *tag = je->tag;
+  char *db_name = je->database;
+
+  if (!vertical) {
+
+    g_string_printf(rowtext, "%s%s%s%s%s%s\t", je->server, tag ? "\t" : "",
+                    tag ? tag : "", db_name ? "\t" : "", db_name ? db_name : "",
+                    timing ? timing_value : "");
+
+    for (int i = 0; i < num_fields; i++) {
+      if (!should_escape || !row[i]) {
+        if (prepend_keys) {
+          g_string_append(rowtext, fields[i].name);
+          g_string_append(rowtext, ":");
+        }
+        g_string_append(rowtext, row[i] ? row[i] : "\\N");
+        g_string_append(rowtext, (num_fields - i == 1) ? "\n" : "\t");
+      } else {
+        /* TODO: we may want to do this once */
+        if (prepend_keys) {
+
+          g_string_set_size(escaped, fields[i].name_length * 2 + 1);
+          line_escape(fields[i].name, fields[i].name_length, escaped->str);
+
+          g_string_append(rowtext, escaped->str);
+          g_string_append(rowtext, ":");
+        }
+
+        g_string_set_size(escaped, lengths[i] * 2 + 1);
+        line_escape(row[i], lengths[i], escaped->str);
+        g_string_append(rowtext, escaped->str);
+        g_string_append(rowtext, (num_fields - i == 1) ? "\n" : "\t");
+      }
+    }
+    write_g_string(STDOUT_FILENO, rowtext);
+  } else {
+    for (int i = 0; i < num_fields; i++) {
+      g_string_printf(rowtext, "%s%s%s%s%s\t%s\t", je->server, tag ? "\t" : "",
+                      tag ? tag : "", db_name ? "\t" : "",
+                      db_name ? db_name : "", fields[i].name);
+
+      if (!row[i]) {
+        g_string_append(rowtext, "\\N\n");
+      } else if (!should_escape) {
+        g_string_append(rowtext, row[i]);
+        g_string_append(rowtext, "\n");
+      } else {
+        g_string_set_size(escaped, lengths[i] * 2 + 1);
+        line_escape(row[i], lengths[i], escaped->str);
+        g_string_append(rowtext, escaped->str);
+        g_string_append(rowtext, "\n");
+      }
+      write_g_string(STDOUT_FILENO, rowtext);
+    }
+  }
+}
+
+void run_query(struct job_entry *je) {
+  int status;
+
+  MYSQL *mysql = je->mysql;
+  MYSQL_ROW row = NULL;
+  if (je->database) {
+    if (mysql_select_db(mysql, je->database)) {
+      g_warning("Could not select db %s on %s: %s", je->database, je->server,
                 mysql_error(mysql));
       return;
     }
   }
 
-  if (timing) {
-    start_time = g_get_monotonic_time();
-  }
+  if (timing)
+    je->start_time = g_get_monotonic_time();
 
+  char *query = je->query ? je->query : the_query;
   if ((status = mysql_query(mysql, query))) {
-    g_warning("Could not execute query on %s: %s", server_name,
+    g_warning("Could not execute query on %s: %s", je->server,
               mysql_error(mysql));
   }
 
-  rowtext = g_string_sized_new(1024);
-  escaped = g_string_sized_new(2048);
-
   do {
-    res = mysql_use_result(mysql);
-    if (res) {
-      num_fields = mysql_num_fields(res);
-      MYSQL_FIELD *fields = mysql_fetch_fields(res);
-
-      if (!vertical) {
-        while ((row = mysql_fetch_row(res))) {
-          unsigned long *lengths = mysql_fetch_lengths(res);
-
-          if (timing) {
-            snprintf(timing_value, 30, "\t%.3f",
-                     (g_get_monotonic_time() - start_time) / 1000000.0);
-          }
-          g_string_printf(rowtext, "%s%s%s%s%s%s\t", server_name,
-                          tag ? "\t" : "", tag ? tag : "", db_name ? "\t" : "",
-                          db_name ? db_name : "", timing ? timing_value : "");
-
-          for (int i = 0; i < num_fields; i++) {
-            if (!should_escape || !row[i]) {
-              if (prepend_keys) {
-                g_string_append(rowtext, fields[i].name);
-                g_string_append(rowtext, ":");
-              }
-              g_string_append(rowtext, row[i] ? row[i] : "\\N");
-              g_string_append(rowtext, (num_fields - i == 1) ? "\n" : "\t");
-            } else {
-              /* TODO: we may want to do this once */
-              if (prepend_keys) {
-
-                g_string_set_size(escaped, fields[i].name_length * 2 + 1);
-                line_escape(fields[i].name, fields[i].name_length,
-                            escaped->str);
-
-                g_string_append(rowtext, escaped->str);
-                g_string_append(rowtext, ":");
-              }
-
-              g_string_set_size(escaped, lengths[i] * 2 + 1);
-              line_escape(row[i], lengths[i], escaped->str);
-              g_string_append(rowtext, escaped->str);
-              g_string_append(rowtext, (num_fields - i == 1) ? "\n" : "\t");
-            }
-          }
-          write_g_string(STDOUT_FILENO, rowtext);
-        }
-      } else {
-        while ((row = mysql_fetch_row(res))) {
-          unsigned long *lengths = mysql_fetch_lengths(res);
-          for (int i = 0; i < num_fields; i++) {
-            g_string_printf(rowtext, "%s%s%s%s%s\t%s\t", server_name,
-                            tag ? "\t" : "", tag ? tag : "",
-                            db_name ? "\t" : "", db_name ? db_name : "",
-                            fields[i].name);
-
-            if (!row[i]) {
-              g_string_append(rowtext, "\\N\n");
-            } else if (!should_escape) {
-              g_string_append(rowtext, row[i]);
-              g_string_append(rowtext, "\n");
-            } else {
-              g_string_set_size(escaped, lengths[i] * 2 + 1);
-              line_escape(row[i], lengths[i], escaped->str);
-              g_string_append(rowtext, escaped->str);
-              g_string_append(rowtext, "\n");
-            }
-            write_g_string(STDOUT_FILENO, rowtext);
-          }
-        }
+    je->result = mysql_use_result(mysql);
+    if (je->result) {
+      while ((row = mysql_fetch_row(je->result))) {
+        print_row(je, row);
       }
 
       if (mysql_errno(mysql))
         g_critical("Could not retrieve result set fully from %s: %s\n",
-                   server_name, mysql_error(mysql));
+                   je->server, mysql_error(mysql));
 
-      mysql_free_result(res);
+      mysql_free_result(je->result);
+      je->result = NULL;
     } else { /* no result set or error */
-
       if (mysql_field_count(mysql) != 0) {
-        g_critical("Could not retrieve result set from %s: %s\n", server_name,
+        g_critical("Could not retrieve result set from %s: %s\n", je->server,
                    mysql_error(mysql));
         break;
       }
     }
     if ((status = mysql_next_result(mysql)) > 0)
-      g_critical("Could not execute statement on %s: %s", server_name,
+      g_critical("Could not execute statement on %s: %s", je->server,
                  mysql_error(mysql));
   } while (status == 0);
+}
 
-  if (rowtext)
-    g_string_free(rowtext, TRUE);
-
-  if (escaped)
-    g_string_free(escaped, TRUE);
+void run_query_on_db(struct job_entry *je, char *db) {
+  char *prev_db = je->database;
+  je->database = db;
+  run_query(je);
+  je->database = prev_db;
 }
 
 /* Search for string in NULL-terminated array */
@@ -381,42 +434,8 @@ gboolean string_in_array(const char *string, const char **array) {
   return (FALSE);
 }
 
-static void worker_thread(gpointer data, gpointer user_data) {
-  int status;
-
-  /* "server", "host" and "query" */
-  struct job_entry *je = (struct job_entry *)data;
-  char *h = strdup(je->server);
-  char *host = h;
-  char *q = je->query ? je->query : (char *)user_data;
-
-  mysql_thread_init();
-  MYSQL *mysql = mysql_init(NULL);
-  MYSQL_RES *res = NULL;
-  MYSQL_ROW row = NULL;
-
-  gulong client_flags = CLIENT_MULTI_STATEMENTS;
-
-  if (should_compress)
-    client_flags |= CLIENT_COMPRESS;
-
-  /* Do we have a special port? */
-  int spec_port = 0;
-  char *p;
-  if (h[0] == '[') {
-    host++;
-    if ((p = strchr(host, ']'))) {
-      *p = 0;
-      p = strchr(++p, ':');
-    }
-  } else {
-    p = strchr(h, ':');
-  }
-
-  if (p) {
-    *p++ = 0;
-    spec_port = atoi(p) + port_incr;
-  }
+static void job_mysql_init(struct job_entry *je) {
+  MYSQL *mysql = je->mysql = mysql_init(NULL);
 
   mysql_options(mysql, MYSQL_READ_DEFAULT_GROUP, "pmysql");
   mysql_options(mysql, MYSQL_OPT_CONNECT_TIMEOUT,
@@ -432,11 +451,19 @@ static void worker_thread(gpointer data, gpointer user_data) {
   mysql_options(mysql, MYSQL_OPT_SSL_MODE, &ssl_mode);
 #endif
   mysql_ssl_set(mysql, ssl_key, ssl_cert, ssl_ca, NULL, NULL);
+}
 
-  if (!mysql_real_connect(mysql, host, username, password, db,
-                          spec_port ? spec_port : port, socket_path,
-                          client_flags)) {
-    g_warning("Could not connect to %s: %s", je->server, mysql_error(mysql));
+static void run_job(struct job_entry *je) {
+  job_mysql_init(je);
+
+  gulong client_flags = CLIENT_MULTI_STATEMENTS;
+  if (should_compress)
+    client_flags |= CLIENT_COMPRESS;
+
+  if (!mysql_real_connect(je->mysql, je->host, username, password, db, je->port,
+                          socket_path, client_flags)) {
+    g_warning("Could not connect to %s: %s", je->server,
+              mysql_error(je->mysql));
     goto cleanup;
   }
 
@@ -447,47 +474,53 @@ static void worker_thread(gpointer data, gpointer user_data) {
      checking for dupes (so query may be executed twice)
   */
   if (all_databases) {
-    if ((status = mysql_query(mysql, "SHOW DATABASES"))) {
+    MYSQL_RES *res = NULL;
+    MYSQL_ROW row = NULL;
+    int status;
+
+    if ((status = mysql_query(je->mysql, "SHOW DATABASES"))) {
       g_warning("Could not get list of databases");
       goto cleanup;
     }
 
-    if (!(res = mysql_store_result(mysql))) {
+    if (!(res = mysql_store_result(je->mysql))) {
       g_warning("Could not get list of databases");
       goto cleanup;
     }
 
     while ((row = mysql_fetch_row(res))) {
       if (!string_in_array(row[0], mdbs))
-        run_query(q, mysql, je->server, row[0], je->tag);
+        run_query_on_db(je, row[0]);
     }
     mysql_free_result(res);
 
     /* Merge --database if specified (both for multiple and single case) */
     if (databases) {
       for (int i = 0; databases[i]; i++) {
-        run_query(q, mysql, je->server, databases[i], je->tag);
+        run_query_on_db(je, databases[i]);
       }
     } else if (db) {
-      run_query(q, mysql, je->server, db, je->tag);
+      run_query_on_db(je, db);
     }
   } else {
     /* Run on all specified databases */
     if (databases) {
       for (int i = 0; databases[i]; i++) {
-        run_query(q, mysql, je->server, databases[i], je->tag);
+        run_query_on_db(je, databases[i]);
       }
     } else {
-      run_query(q, mysql, je->server, je->database, je->tag);
+      run_query(je);
     }
   }
 
 cleanup:
-  mysql_close(mysql);
-  mysql_thread_end();
-
   free_job(je);
-  free(h);
+}
+
+static void worker_thread(gpointer data, gpointer user_data) {
+  (void)user_data;
+  struct job_entry *je = (struct job_entry *)data;
+  run_job(je);
 }
 
 /* This autodetects input format, which is somewhat dynamic.
@@ -557,31 +590,31 @@ int main(int argc, char **argv) {
 
   /* Option postprocessing */
   if (queryfile) {
-    if (query || argc > 1) {
+    if (the_query || argc > 1) {
       g_critical("Both query and query-file provided, "
                  "they are mutually exclusive");
       exit(EXIT_FAILURE);
     }
 
-    if (!g_file_get_contents(queryfile, &query, NULL, &error)) {
+    if (!g_file_get_contents(queryfile, &the_query, NULL, &error)) {
       g_critical("Could not read query file (%s): %s", queryfile,
                  error->message);
       exit(EXIT_FAILURE);
     }
   }
 
-  if ((query && argc > 1) || argc > 2) {
+  if ((the_query && argc > 1) || argc > 2) {
     g_critical("Multiple query arguments provided, "
                "use ; separated list for multiple queries");
     exit(EXIT_FAILURE);
   }
 
-  if (!query && !queryfile) {
+  if (!the_query && !queryfile) {
     if (argc < 2) {
       g_critical("Need query!");
       exit(EXIT_FAILURE);
     }
-    query = argv[1];
+    the_query = argv[1];
   }
 
   if (should_not_escape)
@@ -589,11 +622,12 @@ int main(int argc, char **argv) {
 
   mysql_library_init(0, NULL, NULL);
   MYSQL *mysql = mysql_init(NULL);
-  mysql_thread_init();
 
+  mysql_thread_init();
   init_openssl_locks();
 
   mysql_options(mysql, MYSQL_READ_DEFAULT_GROUP, "pmysql");
+
   /* This is fake connect to remember various options from my.cnf
      for other threads
      Do note, this connect may succeed :-)
@@ -625,7 +659,7 @@ int main(int argc, char **argv) {
   }
 
   GThreadPool *tp =
-      g_thread_pool_new(worker_thread, query, num_threads, TRUE, NULL);
+      g_thread_pool_new(worker_thread, NULL, num_threads, TRUE, NULL);
 
   if (serversfile && strcmp(serversfile, "-")) {
     serversfd = fopen(serversfile, "r");
@@ -638,12 +672,12 @@ int main(int argc, char **argv) {
     serversfd = stdin;
   }
 
-  struct job_entry *j;
+  struct job_entry *je;
 
-  while ((j = read_job(serversfd))) {
-    g_thread_pool_push(tp, j, NULL);
+  while ((je = read_job(serversfd))) {
+    g_thread_pool_push(tp, je, NULL);
   }
 
-  g_thread_pool_free(tp, 0, 1);
+  g_thread_pool_free(tp, FALSE, TRUE);
   exit(EXIT_SUCCESS);
 }
