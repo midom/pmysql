@@ -16,6 +16,8 @@
 
 */
 
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+
 #define _GNU_SOURCE
 
 #include <errno.h>
@@ -27,6 +29,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "threadpool.h"
 
 #ifndef GLIB_VERSION_2_32
 #error "Need at glib 2.32 or later"
@@ -89,6 +93,8 @@ char *ssl_cert = NULL;
 char *ssl_key = NULL;
 
 gboolean ssl = 0;
+gboolean async = 0;
+
 gint ssl_mode = 0;
 
 static GOptionEntry entries[] = {
@@ -97,6 +103,7 @@ static GOptionEntry entries[] = {
      "File to read queries from", NULL},
     {"servers-file", 'X', 0, G_OPTION_ARG_STRING, &serversfile,
      "File to read servers from (stdin otherwise)", NULL},
+    {"async", 'Z', 0, G_OPTION_ARG_NONE, &async, "Use asynchronuous I/O", NULL},
     {"user", 'u', 0, G_OPTION_ARG_STRING, &username,
      "Username with privileges to run the dump", NULL},
     {"password", 'p', 0, G_OPTION_ARG_STRING, &password, "User password", NULL},
@@ -137,6 +144,17 @@ static GOptionEntry entries[] = {
     {"ssl-cert", 0, 0, G_OPTION_ARG_STRING, &ssl_cert, "Public key file", NULL},
     {NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL}};
 
+typedef enum {
+  JOB_INIT,
+  JOB_CONNECTING,
+  JOB_CONNECTED,
+  JOB_QUERY,
+  JOB_FETCHING_RESULT,
+  JOB_FETCHING_ROWS,
+  JOB_FREE_RESULT,
+  JOB_NEXT_RESULT,
+} JOB_STATE;
+
 struct job_entry {
   char *server;
   char *database;
@@ -148,10 +166,20 @@ struct job_entry {
   char *host;
   int port;
 
+  // for async
+  JOB_STATE state;
+  GIOChannel *channel;
+
   MYSQL *mysql;
   MYSQL_RES *result;
   gint64 start_time;
 };
+
+static void job_mysql_init(struct job_entry *);
+
+#ifdef PMYSQL_ASYNC
+static gboolean park(struct job_entry *);
+#endif
 
 static pthread_mutex_t *ssl_lockarray;
 void pmysql_lock_callback(int mode, int type, const char *file, int line) {
@@ -186,7 +214,7 @@ struct job_entry *init_job(const char *server, const char *database,
   char *host = h;
 
   char *p;
-  /* Handle [::1] style IPv6 addresses */
+  /* Handle [::1]:3306 style IPv6 addresses */
   if (h[0] == '[') {
     host++;
     if ((p = strchr(host, ']'))) {
@@ -286,10 +314,10 @@ gulong line_escape(char *from, gulong length, char *to) {
   return t - to;
 }
 
-static inline void g_string_destroy(void *p) { g_string_free(p, TRUE); }
+static inline void g_private_string_destroy(void *p) { g_string_free(p, TRUE); }
 
-static GPrivate rowtext_key = G_PRIVATE_INIT(g_string_destroy);
-static GPrivate escaped_key = G_PRIVATE_INIT(g_string_destroy);
+static GPrivate rowtext_key = G_PRIVATE_INIT(g_private_string_destroy);
+static GPrivate escaped_key = G_PRIVATE_INIT(g_private_string_destroy);
 
 static inline GString *init_private_string(GPrivate *private) {
   GString *ret = g_private_get(private);
@@ -331,7 +359,6 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
         g_string_append(rowtext, row[i] ? row[i] : "\\N");
         g_string_append(rowtext, (num_fields - i == 1) ? "\n" : "\t");
       } else {
-        /* TODO: we may want to do this once */
         if (prepend_keys) {
 
           g_string_set_size(escaped, fields[i].name_length * 2 + 1);
@@ -370,6 +397,162 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
   }
 }
 
+#ifdef PMYSQL_ASYNC
+gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
+                            struct job_entry *je) {
+  int db_error;
+  int ret;
+
+  MYSQL_ROW row;
+
+  (void)source;
+  (void)cond;
+
+  switch (je->state) {
+  case JOB_INIT:
+  case JOB_CONNECTING:
+    je->state = JOB_CONNECTING;
+
+    ret = mysql_real_connect_nonblocking_run(je->mysql, &db_error);
+    if (ret != NET_ASYNC_COMPLETE)
+      return park(je);
+
+    if (db_error) {
+      g_critical("%s", mysql_error(je->mysql));
+      free_job(je);
+      return FALSE;
+    }
+
+  case JOB_CONNECTED:
+    je->state = JOB_CONNECTED;
+    je->start_time = g_get_monotonic_time();
+
+  case JOB_QUERY:
+    je->state = JOB_QUERY;
+    char *query = je->query ? je->query : the_query;
+    ;
+    ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query),
+                                       &db_error);
+    if (ret != NET_ASYNC_COMPLETE)
+      return park(je);
+
+    if (db_error) {
+      g_critical("%s", mysql_error(je->mysql));
+      free_job(je);
+      return FALSE;
+    }
+
+  case JOB_FETCHING_RESULT:
+
+    je->result = mysql_use_result(je->mysql);
+    if (!je->result) {
+      if (mysql_field_count(je->mysql) != 0) {
+        g_critical("Could not retrieve result set from %s: %s", je->server,
+                   mysql_error(je->mysql));
+        free_job(je);
+        return FALSE;
+      }
+    }
+
+  case JOB_FETCHING_ROWS:
+    je->state = JOB_FETCHING_ROWS;
+    while (je->result) {
+      ret = mysql_fetch_row_nonblocking(je->result, &row);
+      if (ret != NET_ASYNC_COMPLETE)
+        return park(je);
+
+      if (row)
+        print_row(je, row);
+
+      if (mysql_errno(je->mysql)) {
+        g_critical("Could not fully retrieve results from %s: %s", je->server,
+                   mysql_error(je->mysql));
+        free_job(je);
+        return FALSE;
+      }
+
+      if (!row)
+        break;
+    }
+  case JOB_FREE_RESULT:
+    je->state = JOB_FREE_RESULT;
+    if (je->result) {
+      if (mysql_free_result_nonblocking(je->result) != NET_ASYNC_COMPLETE)
+        return park(je);
+    }
+    je->result = NULL;
+
+  case JOB_NEXT_RESULT:
+    je->state = JOB_NEXT_RESULT;
+    ret = mysql_next_result_nonblocking(je->mysql, &db_error);
+    if (ret != NET_ASYNC_COMPLETE)
+      return park(je);
+    if (db_error > 0) {
+      g_critical("Could not execute statement on %s: %s", je->server,
+                 mysql_error(je->mysql));
+    } else if (db_error == 0) {
+      je->state = JOB_FETCHING_RESULT;
+      return park(je);
+    }
+  default:
+    return FALSE;
+  }
+}
+
+gboolean park(struct job_entry *je) {
+  GIOCondition cond;
+  switch (je->mysql->net.async_blocking_state) {
+  case NET_NONBLOCKING_WRITE:
+    cond = G_IO_OUT;
+    break;
+  case NET_NONBLOCKING_READ:
+    cond = G_IO_IN;
+    break;
+  default:
+    g_assert("Parked on unknown async state");
+  }
+
+  g_event_pool_wait((GIOFunc)run_query_async_cb, je->channel, cond, je);
+  return FALSE;
+}
+
+int run_query_async_init(GIOChannel *src, GIOCondition cond, gpointer data) {
+  g_assert(!src);
+  g_assert(!cond);
+
+  struct job_entry *je = data;
+  int db_error;
+
+  je->state = JOB_INIT;
+  job_mysql_init(je);
+
+  int client_flags = CLIENT_MULTI_STATEMENTS; // XXX: flags
+  mysql_real_connect_nonblocking_init(je->mysql, je->host, username, password,
+                                      je->database ? je->database : db,
+                                      je->port, socket_path, client_flags);
+
+  je->state = JOB_CONNECTING;
+  int ret = mysql_real_connect_nonblocking_run(je->mysql, &db_error);
+  int fd = mysql_get_file_descriptor(je->mysql);
+  if (fd == -1) {
+    g_critical("%s", mysql_error(je->mysql));
+    free_job(je);
+    return FALSE;
+  }
+  je->channel = g_io_channel_unix_new(fd);
+
+  if (ret == NET_ASYNC_COMPLETE) {
+    if (db_error) {
+
+      return FALSE;
+    }
+    je->state = JOB_CONNECTED;
+  }
+  return park(je);
+}
+
+#endif /* PMYSQL_ASYNC */
+
 void run_query(struct job_entry *je) {
   int status;
 
@@ -400,14 +583,14 @@ void run_query(struct job_entry *je) {
       }
 
       if (mysql_errno(mysql))
-        g_critical("Could not retrieve result set fully from %s: %s\n",
+        g_critical("Could not retrieve result set fully from %s: %s",
                    je->server, mysql_error(mysql));
 
       mysql_free_result(je->result);
       je->result = NULL;
     } else { /* no result set or error */
       if (mysql_field_count(mysql) != 0) {
-        g_critical("Could not retrieve result set from %s: %s\n", je->server,
+        g_critical("Could not retrieve result set from %s: %s", je->server,
                    mysql_error(mysql));
         break;
       }
@@ -426,7 +609,7 @@ void run_query_on_db(struct job_entry *je, char *db) {
 }
 
 /* Search for string in NULL-terminated array */
-gboolean string_in_array(const char *string, const char **array) {
+gboolean str_in_array(const char *string, const char **array) {
   for (const char **s = &array[0]; *s != NULL; s++) {
     if (!strcmp(*s, string))
       return (TRUE);
@@ -460,7 +643,8 @@ static void run_job(struct job_entry *je) {
   if (should_compress)
     client_flags |= CLIENT_COMPRESS;
 
-  if (!mysql_real_connect(je->mysql, je->host, username, password, db, je->port,
+  if (!mysql_real_connect(je->mysql, je->host, username, password,
+                          je->database ? je->database : db, je->port,
                           socket_path, client_flags)) {
     g_warning("Could not connect to %s: %s", je->server,
               mysql_error(je->mysql));
@@ -489,7 +673,7 @@ static void run_job(struct job_entry *je) {
     }
 
     while ((row = mysql_fetch_row(res))) {
-      if (!string_in_array(row[0], mdbs))
+      if (!str_in_array(row[0], mdbs))
         run_query_on_db(je, row[0]);
     }
     mysql_free_result(res);
@@ -521,6 +705,9 @@ static void worker_thread(gpointer data, gpointer user_data) {
   (void)user_data;
   struct job_entry *je = (struct job_entry *)data;
   run_job(je);
+#ifdef DEBUG
+  mysql_thread_end();
+#endif
 }
 
 /* This autodetects input format, which is somewhat dynamic.
@@ -534,6 +721,9 @@ struct job_entry *read_job(FILE *fd) {
   for (;;) {
     if (!fgets(line, MAXLINE - 1, fd))
       return NULL;
+
+    if (line[0] == '#')
+      continue;
 
     char *nl = strchr(line, '\n');
     if (nl)
@@ -658,9 +848,6 @@ int main(int argc, char **argv) {
       connect_timeout = CONNECT_TIMEOUT;
   }
 
-  GThreadPool *tp =
-      g_thread_pool_new(worker_thread, NULL, num_threads, TRUE, NULL);
-
   if (serversfile && strcmp(serversfile, "-")) {
     serversfd = fopen(serversfile, "r");
     if (!serversfd) {
@@ -674,10 +861,34 @@ int main(int argc, char **argv) {
 
   struct job_entry *je;
 
-  while ((je = read_job(serversfd))) {
-    g_thread_pool_push(tp, je, NULL);
+  if (!async) {
+    GThreadPool *tp =
+        g_thread_pool_new(worker_thread, NULL, num_threads, TRUE, NULL);
+
+    while ((je = read_job(serversfd))) {
+      g_thread_pool_push(tp, je, NULL);
+    }
+
+    g_thread_pool_free(tp, FALSE, TRUE);
+  } else {
+#ifdef PMYSQL_ASYNC
+    GEventPool *pool =
+        g_event_pool_new(run_query_async_init, NULL, num_threads, NULL);
+    while ((je = read_job(serversfd))) {
+      g_event_pool_push(pool, je);
+    }
+    g_event_pool_shutdown(pool, TRUE);
+#else
+    g_critical("Async I/O not supported in this build");
+#endif
   }
 
-  g_thread_pool_free(tp, FALSE, TRUE);
+#ifdef DEBUG
+  mysql_close(mysql);
+  // mysql_thread_end();
+  // mysql_library_end();
+  fclose(serversfd);
+#endif
+
   exit(EXIT_SUCCESS);
 }
