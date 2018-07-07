@@ -1,10 +1,13 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include "threadpool.h"
 #include <glib.h>
 #include <stdio.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <errno.h>
 
 int g_event_pool_queue_task(GSource *source, GIOCondition condition,
                             void *user_data) {
@@ -16,8 +19,8 @@ int g_event_pool_queue_task(GSource *source, GIOCondition condition,
     return !pool->quit;
   guint64 i;
   int r = read(pool->eventfd, &i, sizeof(i));
-  if (r != 8)
-    g_critical("Wrong read from eventfd: %d", r);
+  if (r != 8 && errno != EAGAIN)
+    g_critical("Wrong read from eventfd: %d, %d", r, errno);
 
 
   pool->func(NULL, 0, job);
@@ -70,7 +73,6 @@ void g_event_pool_runner(struct GEventPoolRunner *runner) {
   g_source_set_callback(source, (GSourceFunc)g_event_pool_queue_task, pool,
                         NULL);
   g_source_attach(source, context);
-  g_source_unref(source);
 
   /* We loop when we're:
    * 1. not shut down
@@ -99,16 +101,6 @@ void g_event_pool_runner(struct GEventPoolRunner *runner) {
   while (g_main_context_query(context, 0, &timeout, fds, 2) > 1)
 	  g_main_context_iteration(context, TRUE);
 
-
-  /* 
-
-  GSource *task = g_idle_source_new();
-  g_source_set_callback(task, (GSourceFunc)g_event_pool_runner_cleanup, runner, NULL);
-  runner->tag = g_source_attach(task, g_main_context_get_thread_default());
-  g_source_unref(task);
-
-  g_main_context_iteration(context, TRUE);
-  */
 }
 
 void g_event_pool_shutdown(GEventPool *pool, gboolean wait) {

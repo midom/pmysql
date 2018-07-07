@@ -16,9 +16,9 @@
 
 */
 
-#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
-
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <errno.h>
 #include <glib.h>
@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysinfo.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -62,7 +63,8 @@ char *queryfile = NULL;
 
 char *serversfile = NULL;
 
-int num_threads = 200;
+int default_num_threads = 200;
+int num_threads = 0;
 
 #define CONNECT_TIMEOUT 2
 
@@ -94,6 +96,8 @@ char *ssl_key = NULL;
 
 gboolean ssl = 0;
 gboolean async = 0;
+
+SSL_CTX *ssl_ctx = NULL;
 
 gint ssl_mode = 0;
 
@@ -263,6 +267,9 @@ void free_job(struct job_entry *je) {
   if (je->mysql)
     mysql_close(je->mysql);
 
+  if (je->channel)
+    g_io_channel_unref(je->channel);
+
   g_free(je);
 }
 
@@ -427,6 +434,16 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
     je->state = JOB_CONNECTED;
     je->start_time = g_get_monotonic_time();
 
+    /* First connected session will store its SSL context globally,
+     * there will be other ones in flight that will have their own,
+     * but no more than there're workers */
+
+    static gsize ssl_ctx_init;
+    if (g_once_init_enter(&ssl_ctx_init)) {
+      ssl_ctx = mysql_take_ssl_context_ownership(je->mysql);
+      g_once_init_leave(&ssl_ctx_init, 1);
+    }
+
   case JOB_QUERY:
     je->state = JOB_QUERY;
     char *query = je->query ? je->query : the_query;
@@ -495,6 +512,7 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       return park(je);
     }
   default:
+    free_job(je);
     return FALSE;
   }
 }
@@ -510,6 +528,7 @@ gboolean park(struct job_entry *je) {
     break;
   default:
     g_assert("Parked on unknown async state");
+    return FALSE;
   }
 
   g_event_pool_wait((GIOFunc)run_query_async_cb, je->channel, cond, je);
@@ -624,6 +643,9 @@ static void job_mysql_init(struct job_entry *je) {
   mysql_options(mysql, MYSQL_OPT_CONNECT_TIMEOUT,
                 (const char *)&connect_timeout);
 
+  if (ssl_ctx)
+    mysql_options(mysql, MYSQL_OPT_SSL_CONTEXT, ssl_ctx);
+
   if (read_timeout)
     mysql_options(mysql, MYSQL_OPT_READ_TIMEOUT, (const char *)&read_timeout);
 
@@ -649,6 +671,12 @@ static void run_job(struct job_entry *je) {
     g_warning("Could not connect to %s: %s", je->server,
               mysql_error(je->mysql));
     goto cleanup;
+  }
+
+  static gsize ssl_ctx_init;
+  if (g_once_init_enter(&ssl_ctx_init)) {
+    ssl_ctx = mysql_take_ssl_context_ownership(je->mysql);
+    g_once_init_leave(&ssl_ctx_init, 1);
   }
 
   /* We run query on all databases except
@@ -862,8 +890,9 @@ int main(int argc, char **argv) {
   struct job_entry *je;
 
   if (!async) {
-    GThreadPool *tp =
-        g_thread_pool_new(worker_thread, NULL, num_threads, TRUE, NULL);
+    GThreadPool *tp = g_thread_pool_new(
+        worker_thread, NULL, num_threads ? num_threads : default_num_threads,
+        TRUE, NULL);
 
     while ((je = read_job(serversfd))) {
       g_thread_pool_push(tp, je, NULL);
@@ -873,7 +902,8 @@ int main(int argc, char **argv) {
   } else {
 #ifdef PMYSQL_ASYNC
     GEventPool *pool =
-        g_event_pool_new(run_query_async_init, NULL, num_threads, NULL);
+        g_event_pool_new(run_query_async_init, NULL,
+                         num_threads ? num_threads : get_nprocs(), NULL);
     while ((je = read_job(serversfd))) {
       g_event_pool_push(pool, je);
     }
@@ -885,8 +915,8 @@ int main(int argc, char **argv) {
 
 #ifdef DEBUG
   mysql_close(mysql);
-  // mysql_thread_end();
-  // mysql_library_end();
+  mysql_thread_end();
+  mysql_library_end();
   fclose(serversfd);
 #endif
 
