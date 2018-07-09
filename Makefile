@@ -1,4 +1,4 @@
-CFLAGS+=-Wall -Wextra -g -std=c99 `mysql_config --cflags` `pkg-config glib-2.0 gthread-2.0 --cflags`
+CFLAGS+=-Wall -Wextra -g -std=c99 `mysql_config --cflags` `pkg-config glib-2.0 gthread-2.0 --cflags` -Wno-implicit-fallthrough
 LDLIBS+=`mysql_config --libs_r | sed -e s/zlib/z/` `pkg-config glib-2.0 gthread-2.0 --libs` -lcrypto
 
 all: pmysql

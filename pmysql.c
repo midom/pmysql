@@ -39,7 +39,7 @@
 
 /* Allow providing special meta database to skip at --all */
 
-#define MYSQLDBS "information_schema", "mysql", "performance_schema", "test"
+#define MYSQLDBS "information_schema", "mysql", "performance_schema", "test", "sys"
 
 #ifndef METADB
 const char *mdbs[] = {MYSQLDBS, NULL};
@@ -152,6 +152,9 @@ typedef enum {
   JOB_INIT,
   JOB_CONNECTING,
   JOB_CONNECTED,
+  JOB_LIST_DATABASES,
+  JOB_FETCH_DATABASES,
+  JOB_SELECT_DATABASE,
   JOB_QUERY,
   JOB_FETCHING_RESULT,
   JOB_FETCHING_ROWS,
@@ -165,6 +168,10 @@ struct job_entry {
   // For fine grained jobs
   char *query;
   char *tag;
+
+  // For multi-db ones
+  GQueue *dblist;
+  char *in_db;
 
   // Derived from server and settings
   char *host;
@@ -270,6 +277,16 @@ void free_job(struct job_entry *je) {
   if (je->channel)
     g_io_channel_unref(je->channel);
 
+  if (je->in_db)
+    free(je->in_db);
+
+  if (je->dblist) {
+	  char *p;
+    while ((p = g_queue_pop_head(je->dblist)))
+      free(p);
+    g_queue_free(je->dblist);
+  }
+
   g_free(je);
 }
 
@@ -349,7 +366,7 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
              (g_get_monotonic_time() - je->start_time) / 1000000.0);
   }
   char *tag = je->tag;
-  char *db_name = je->database;
+  char *db_name = je->in_db ? je->in_db : je->database;
 
   if (!vertical) {
 
@@ -443,11 +460,86 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       ssl_ctx = mysql_take_ssl_context_ownership(je->mysql);
       g_once_init_leave(&ssl_ctx_init, 1);
     }
+  case JOB_LIST_DATABASES:
+    je->state = JOB_LIST_DATABASES;
+    if (all_databases) {
+      char *query = "SHOW DATABASES";
+      ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query),
+                                         &db_error);
+      if (ret != NET_ASYNC_COMPLETE)
+        return park(je);
+
+      if (db_error) {
+        g_critical("%s", mysql_error(je->mysql));
+        free_job(je);
+        return FALSE;
+      }
+      je->result = mysql_use_result(je->mysql);
+      if (!je->result) {
+        g_critical("Could not retrieve database list: %s",
+                   mysql_error(je->mysql));
+        free_job(je);
+        return FALSE;
+      }
+    }
+  case JOB_FETCH_DATABASES:
+    je->state = JOB_FETCH_DATABASES;
+    if (databases) {
+       if (!je->dblist)
+         je->dblist = g_queue_new();
+       for (int i = 0; databases[i]; i++)
+         g_queue_push_tail(je->dblist, strdup(databases[i]));
+    }
+
+
+    if (all_databases) {
+      if (!je->dblist)
+        je->dblist = g_queue_new();
+
+      while (je->result) {
+        ret = mysql_fetch_row_nonblocking(je->result, &row);
+        if (ret != NET_ASYNC_COMPLETE)
+          return park(je);
+
+        if (row) {
+          g_queue_push_tail(je->dblist, strdup(row[0]));
+        } else {
+          mysql_free_result(je->result);
+          je->result = NULL;
+        }
+      }
+    }
+
+  case JOB_SELECT_DATABASE:
+  select_db:
+    je->state = JOB_SELECT_DATABASE;
+    if (je->dblist) {
+      if (!je->in_db) {
+        je->in_db = g_queue_pop_head(je->dblist);
+      }
+
+      if (!je->in_db) {
+        free_job(je);
+        return FALSE;
+      }
+
+      char *query = g_strdup_printf("USE `%s`", je->in_db);
+      ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query), &db_error);
+      free(query);
+      if (ret == NET_ASYNC_NOT_READY) {
+        return park(je);
+      }
+
+      if (db_error && mysql_errno(je->mysql)) {
+        g_critical("%s", mysql_error(je->mysql));
+        free_job(je);
+        return FALSE;
+      }
+    }
 
   case JOB_QUERY:
     je->state = JOB_QUERY;
     char *query = je->query ? je->query : the_query;
-    ;
     ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query),
                                        &db_error);
     if (ret != NET_ASYNC_COMPLETE)
@@ -512,6 +604,11 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       return park(je);
     }
   default:
+    if (je->dblist) {
+      free(je->in_db);
+      je->in_db = NULL;
+      goto select_db;
+    }
     free_job(je);
     return FALSE;
   }
@@ -527,8 +624,9 @@ gboolean park(struct job_entry *je) {
     cond = G_IO_IN;
     break;
   default:
-    g_assert("Parked on unknown async state");
-    return FALSE;
+    // Need to be sure connection is writable, if it is not waiting
+    cond = G_IO_OUT;
+    break;
   }
 
   g_event_pool_wait((GIOFunc)run_query_async_cb, je->channel, cond, je);
@@ -562,7 +660,8 @@ int run_query_async_init(GIOChannel *src, GIOCondition cond, gpointer data) {
 
   if (ret == NET_ASYNC_COMPLETE) {
     if (db_error) {
-
+      g_critical("%s", mysql_error(je->mysql));
+      free_job(je);
       return FALSE;
     }
     je->state = JOB_CONNECTED;
