@@ -31,7 +31,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+#ifndef PMYSQL_ASYNC
+#define PMYSQL_ASYNC
+#endif
 #include "threadpool.h"
+#endif
+
 
 #ifndef GLIB_VERSION_2_32
 #error "Need at glib 2.32 or later"
@@ -749,13 +755,15 @@ static void job_mysql_init(struct job_entry *je) {
   mysql_options(mysql, MYSQL_OPT_CONNECT_TIMEOUT,
                 (const char *)&connect_timeout);
 
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
   if (ssl_ctx)
     mysql_options(mysql, MYSQL_OPT_SSL_CONTEXT, ssl_ctx);
+#endif
 
   if (read_timeout)
     mysql_options(mysql, MYSQL_OPT_READ_TIMEOUT, (const char *)&read_timeout);
 
-#ifdef MYSQL_OPT_SSL_MODE
+#ifdef SSLOPT_CASE_INCLUDED
   if (ssl)
     ssl_mode = SSL_MODE_VERIFY_IDENTITY;
 
@@ -779,11 +787,13 @@ static void run_job(struct job_entry *je) {
     goto cleanup;
   }
 
+#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
   static gsize ssl_ctx_init;
   if (g_once_init_enter(&ssl_ctx_init)) {
     ssl_ctx = mysql_take_ssl_context_ownership(je->mysql);
     g_once_init_leave(&ssl_ctx_init, 1);
   }
+#endif
 
   /* We run query on all databases except
      mysql,test,information_schema,performance_schema if --all is specified
