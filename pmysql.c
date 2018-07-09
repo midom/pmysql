@@ -39,7 +39,8 @@
 
 /* Allow providing special meta database to skip at --all */
 
-#define MYSQLDBS "information_schema", "mysql", "performance_schema", "test", "sys"
+#define MYSQLDBS                                                               \
+  "information_schema", "mysql", "performance_schema", "test", "sys"
 
 #ifndef METADB
 const char *mdbs[] = {MYSQLDBS, NULL};
@@ -188,6 +189,8 @@ struct job_entry {
 
 static void job_mysql_init(struct job_entry *);
 
+gboolean str_in_array(const char *, const char **);
+
 #ifdef PMYSQL_ASYNC
 static gboolean park(struct job_entry *);
 #endif
@@ -281,7 +284,7 @@ void free_job(struct job_entry *je) {
     free(je->in_db);
 
   if (je->dblist) {
-	  char *p;
+    char *p;
     while ((p = g_queue_pop_head(je->dblist)))
       free(p);
     g_queue_free(je->dblist);
@@ -484,25 +487,26 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
     }
   case JOB_FETCH_DATABASES:
     je->state = JOB_FETCH_DATABASES;
-    if (databases) {
-       if (!je->dblist)
-         je->dblist = g_queue_new();
-       for (int i = 0; databases[i]; i++)
-         g_queue_push_tail(je->dblist, strdup(databases[i]));
+    if (!je->dblist && (databases || all_databases)) {
+      je->dblist = g_queue_new();
+      if (db)
+        g_queue_push_tail(je->dblist, strdup(db));
     }
 
+    if (databases) {
+      for (int i = 0; databases[i]; i++)
+        g_queue_push_tail(je->dblist, strdup(databases[i]));
+    }
 
     if (all_databases) {
-      if (!je->dblist)
-        je->dblist = g_queue_new();
-
       while (je->result) {
         ret = mysql_fetch_row_nonblocking(je->result, &row);
         if (ret != NET_ASYNC_COMPLETE)
           return park(je);
 
         if (row) {
-          g_queue_push_tail(je->dblist, strdup(row[0]));
+          if (!str_in_array(row[0], mdbs))
+            g_queue_push_tail(je->dblist, strdup(row[0]));
         } else {
           mysql_free_result(je->result);
           je->result = NULL;
@@ -524,7 +528,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       }
 
       char *query = g_strdup_printf("USE `%s`", je->in_db);
-      ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query), &db_error);
+      ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query),
+                                         &db_error);
       free(query);
       if (ret == NET_ASYNC_NOT_READY) {
         return park(je);
@@ -644,6 +649,8 @@ int run_query_async_init(GIOChannel *src, GIOCondition cond, gpointer data) {
   job_mysql_init(je);
 
   int client_flags = CLIENT_MULTI_STATEMENTS; // XXX: flags
+  if (should_compress)
+    client_flags |= CLIENT_COMPRESS;
   mysql_real_connect_nonblocking_init(je->mysql, je->host, username, password,
                                       je->database ? je->database : db,
                                       je->port, socket_path, client_flags);
@@ -962,7 +969,7 @@ int main(int argc, char **argv) {
   /* Support for a list of databases */
   if (db && strchr(db, ',')) {
     databases = g_strsplit(db, ",", 0);
-    *strchr(db, ',') = 0;
+    db = NULL;
   }
 
   if (!socket_path)
