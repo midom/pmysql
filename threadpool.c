@@ -3,11 +3,21 @@
 #endif
 
 #include "threadpool.h"
+#include <errno.h>
 #include <glib.h>
 #include <stdio.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-#include <errno.h>
+
+/* When a callback can get invoked via multiple event sources - timeouts or file
+ * descriptors, we need to wrap it. */
+struct GEventPoolTimeoutWrapper {
+  GIOFunc func;
+  gpointer user_data;
+  GSource *time_source;
+  GSource *poll_source;
+};
+typedef struct GEventPoolTimeoutWrapper GEventPoolTimeoutWrapper;
 
 int g_event_pool_queue_task(GSource *source, GIOCondition condition,
                             void *user_data) {
@@ -21,7 +31,6 @@ int g_event_pool_queue_task(GSource *source, GIOCondition condition,
   int r = read(pool->eventfd, &i, sizeof(i));
   if (r != 8 && errno != EAGAIN)
     g_critical("Wrong read from eventfd: %d, %d", r, errno);
-
 
   pool->func(NULL, 0, job);
   return TRUE;
@@ -44,6 +53,47 @@ void g_event_pool_wait(GIOFunc func, GIOChannel *channel,
   g_source_unref(source);
 }
 
+gboolean g_event_pool_timeout_cb(GEventPoolTimeoutWrapper *wrapper) {
+  g_source_destroy(wrapper->poll_source);
+  gboolean ret = wrapper->func(NULL, G_IO_ERR | G_IO_HUP, wrapper->user_data);
+  g_free(wrapper);
+  return ret;
+}
+
+gboolean g_event_pool_cb(GIOChannel *source, GIOCondition cond,
+                         GEventPoolTimeoutWrapper *wrapper) {
+  g_source_destroy(wrapper->time_source);
+  gboolean ret = wrapper->func(source, cond, wrapper->user_data);
+  g_free(wrapper);
+  return ret;
+}
+
+void g_event_pool_timed_wait(GIOFunc func, GIOChannel *channel,
+                             GIOCondition condition, gpointer data,
+                             guint seconds) {
+
+  if (!seconds)
+    return g_event_pool_wait(func, channel, condition, data);
+
+  GEventPoolTimeoutWrapper *wrapper = g_new0(GEventPoolTimeoutWrapper, 1);
+
+  wrapper->poll_source = g_io_create_watch(channel, condition);
+  wrapper->time_source = g_timeout_source_new_seconds(seconds);
+  wrapper->func = func;
+  wrapper->user_data = data;
+
+  g_source_set_callback(wrapper->poll_source, (GSourceFunc)g_event_pool_cb,
+                        wrapper, NULL);
+  g_source_set_callback(wrapper->time_source,
+                        (GSourceFunc)g_event_pool_timeout_cb, wrapper, NULL);
+
+  g_source_attach(wrapper->poll_source, g_main_context_get_thread_default());
+  g_source_attach(wrapper->time_source, g_main_context_get_thread_default());
+
+  g_source_unref(wrapper->poll_source);
+  g_source_unref(wrapper->time_source);
+}
+
 gboolean g_event_pool_runner_cleanup(GEventPoolRunner *runner) {
   GMainContext *context = runner->context;
 
@@ -51,11 +101,11 @@ gboolean g_event_pool_runner_cleanup(GEventPoolRunner *runner) {
 
   GSource *source = g_main_context_find_source_by_id(context, runner->tag);
   if (source)
-	  g_source_destroy(source);
+    g_source_destroy(source);
 
   GPollFD fds[3];
-  while (g_main_context_query(context, 0, &timeout, fds, 3)>2)
-	  g_main_context_iteration(context, TRUE);
+  while (g_main_context_query(context, 0, &timeout, fds, 3) > 2)
+    g_main_context_iteration(context, TRUE);
 
   return FALSE;
 }
@@ -86,8 +136,8 @@ void g_event_pool_runner(struct GEventPoolRunner *runner) {
   while (g_async_queue_length(pool->queue))
     g_main_context_iteration(context, TRUE);
 
-  while (g_main_context_iteration(context, FALSE));
-
+  while (g_main_context_iteration(context, FALSE))
+    ;
 
   /* There is no clener way to check if eventloop has
    * more events than itself, so we do it this way.
@@ -99,8 +149,7 @@ void g_event_pool_runner(struct GEventPoolRunner *runner) {
   GPollFD fds[2];
   int timeout;
   while (g_main_context_query(context, 0, &timeout, fds, 2) > 1)
-	  g_main_context_iteration(context, TRUE);
-
+    g_main_context_iteration(context, TRUE);
 }
 
 void g_event_pool_shutdown(GEventPool *pool, gboolean wait) {
@@ -113,8 +162,8 @@ void g_event_pool_shutdown(GEventPool *pool, gboolean wait) {
   }
 }
 
-GEventPool *g_event_pool_new(GIOFunc func, gpointer user_data,
-                             gint num_threads, GError **error) {
+GEventPool *g_event_pool_new(GIOFunc func, gpointer user_data, gint num_threads,
+                             GError **error) {
 
   (void)error;
 

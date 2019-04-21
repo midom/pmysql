@@ -38,7 +38,6 @@
 #include "threadpool.h"
 #endif
 
-
 #ifndef GLIB_VERSION_2_32
 #error "Need at glib 2.32 or later"
 #endif
@@ -200,6 +199,7 @@ gboolean str_in_array(const char *, const char **);
 #ifdef PMYSQL_ASYNC
 static gboolean park(struct job_entry *);
 #endif
+void flush_buffers();
 
 static pthread_mutex_t *ssl_lockarray;
 void pmysql_lock_callback(int mode, int type, const char *file, int line) {
@@ -270,6 +270,7 @@ struct job_entry *init_job(const char *server, const char *database,
 }
 
 void free_job(struct job_entry *je) {
+  flush_buffers();
   free(je->server);
   free(je->host);
 
@@ -299,19 +300,33 @@ void free_job(struct job_entry *je) {
   g_free(je);
 }
 
-void write_g_string(int fd, GString *data) {
-  static GMutex write_mutex;
+void write_g_string_locked(GString *data) {
   ssize_t written = 0, r = 0;
 
-  g_mutex_lock(&write_mutex);
   while (written < (ssize_t)data->len) {
-    r = write(fd, data->str + written, data->len);
+    r = write(STDOUT_FILENO, data->str + written, data->len);
     if (r < 0) {
       g_critical("Couldn't write output data to a file: %s", strerror(errno));
       exit(EXIT_FAILURE);
     }
     written += r;
   }
+}
+
+void flush_g_string(GString *data, gboolean force) {
+  static GMutex write_mutex;
+
+  if (!data->len)
+    return;
+
+  if (force || data->len > 16368) {
+    g_mutex_lock(&write_mutex);
+  } else if (!g_mutex_trylock(&write_mutex)) {
+    return;
+  }
+
+  write_g_string_locked(data);
+  g_string_set_size(data, 0);
   g_mutex_unlock(&write_mutex);
 }
 
@@ -361,6 +376,18 @@ static inline GString *init_private_string(GPrivate *private) {
   return ret;
 }
 
+/* flush_g_string() may leave unwritten data behind,
+ * so we call flush_buffers() either when parking async job
+ * or when finishing the job in threaded mode.
+ */
+void flush_buffers() {
+  GString *rowtext = init_private_string(&rowtext_key);
+  flush_g_string(rowtext, TRUE);
+}
+
+/* Main output formatting function - all of tabulation, escaping
+ * and other formatting logic goes here.
+ */
 void print_row(struct job_entry *je, MYSQL_ROW row) {
   char *timing_value = timing ? g_newa(char, 30) : NULL;
   GString *rowtext = init_private_string(&rowtext_key);
@@ -378,10 +405,10 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
   char *db_name = je->in_db ? je->in_db : je->database;
 
   if (!vertical) {
-
-    g_string_printf(rowtext, "%s%s%s%s%s%s\t", je->server, tag ? "\t" : "",
-                    tag ? tag : "", db_name ? "\t" : "", db_name ? db_name : "",
-                    timing ? timing_value : "");
+    /* Regular tab-separated row output */
+    g_string_append_printf(rowtext, "%s%s%s%s%s%s\t", je->server,
+                           tag ? "\t" : "", tag ? tag : "", db_name ? "\t" : "",
+                           db_name ? db_name : "", timing ? timing_value : "");
 
     for (int i = 0; i < num_fields; i++) {
       if (!should_escape || !row[i]) {
@@ -407,12 +434,14 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
         g_string_append(rowtext, (num_fields - i == 1) ? "\n" : "\t");
       }
     }
-    write_g_string(STDOUT_FILENO, rowtext);
+    flush_g_string(rowtext, FALSE);
   } else {
+    /* Row-per-field output, with field name in a separate column */
     for (int i = 0; i < num_fields; i++) {
-      g_string_printf(rowtext, "%s%s%s%s%s\t%s\t", je->server, tag ? "\t" : "",
-                      tag ? tag : "", db_name ? "\t" : "",
-                      db_name ? db_name : "", fields[i].name);
+      g_string_append_printf(rowtext, "%s%s%s%s%s\t%s\t", je->server,
+                             tag ? "\t" : "", tag ? tag : "",
+                             db_name ? "\t" : "", db_name ? db_name : "",
+                             fields[i].name);
 
       if (!row[i]) {
         g_string_append(rowtext, "\\N\n");
@@ -425,7 +454,7 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
         g_string_append(rowtext, escaped->str);
         g_string_append(rowtext, "\n");
       }
-      write_g_string(STDOUT_FILENO, rowtext);
+      flush_g_string(rowtext, FALSE);
     }
   }
 }
@@ -433,13 +462,44 @@ void print_row(struct job_entry *je, MYSQL_ROW row) {
 #ifdef PMYSQL_ASYNC
 gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
                             struct job_entry *je) {
+
   int db_error;
   int ret;
 
   MYSQL_ROW row;
 
-  (void)source;
-  (void)cond;
+  // Timeouts!
+  if (!source && cond == (G_IO_ERR | G_IO_HUP)) {
+    char *tstate;
+    switch (je->state) {
+    case JOB_INIT:
+    case JOB_CONNECTING:
+    case JOB_CONNECTED:
+      g_warning("Could not connect to %s: Connection timed out", je->server);
+      free_job(je);
+      return FALSE;
+
+    case JOB_LIST_DATABASES:
+    case JOB_FETCH_DATABASES:
+      tstate = "listing databases";
+      break;
+
+    case JOB_SELECT_DATABASE:
+      tstate = "selecting database";
+      break;
+
+    case JOB_QUERY:
+      tstate = "running query";
+      break;
+
+    default:
+      tstate = "reading results";
+    }
+    g_warning("Could not execute query on %s: Timeout while %s.", je->server,
+              tstate);
+    free_job(je);
+    return FALSE;
+  }
 
   switch (je->state) {
   case JOB_INIT:
@@ -451,7 +511,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       return park(je);
 
     if (db_error) {
-      g_critical("%s", mysql_error(je->mysql));
+      g_warning("Could not connect to %s: %s", je->server,
+                mysql_error(je->mysql));
       free_job(je);
       return FALSE;
     }
@@ -479,14 +540,15 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
         return park(je);
 
       if (db_error) {
-        g_critical("%s", mysql_error(je->mysql));
+        g_warning("Could not list databases on %s: %s", je->server,
+                  mysql_error(je->mysql));
         free_job(je);
         return FALSE;
       }
       je->result = mysql_use_result(je->mysql);
       if (!je->result) {
-        g_critical("Could not retrieve database list: %s",
-                   mysql_error(je->mysql));
+        g_warning("Could not retrieve database list from %s: %s", je->server,
+                  mysql_error(je->mysql));
         free_job(je);
         return FALSE;
       }
@@ -542,7 +604,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       }
 
       if (db_error && mysql_errno(je->mysql)) {
-        g_critical("%s", mysql_error(je->mysql));
+        g_warning("Could not select database on %s: %s", je->server,
+                  mysql_error(je->mysql));
         free_job(je);
         return FALSE;
       }
@@ -557,7 +620,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
       return park(je);
 
     if (db_error) {
-      g_critical("%s", mysql_error(je->mysql));
+      g_warning("Could not execute query on %s: %s", je->server,
+                mysql_error(je->mysql));
       free_job(je);
       return FALSE;
     }
@@ -567,8 +631,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
     je->result = mysql_use_result(je->mysql);
     if (!je->result) {
       if (mysql_field_count(je->mysql) != 0) {
-        g_critical("Could not retrieve result set from %s: %s", je->server,
-                   mysql_error(je->mysql));
+        g_warning("Could not retrieve result set from %s: %s", je->server,
+                  mysql_error(je->mysql));
         free_job(je);
         return FALSE;
       }
@@ -585,8 +649,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
         print_row(je, row);
 
       if (mysql_errno(je->mysql)) {
-        g_critical("Could not fully retrieve results from %s: %s", je->server,
-                   mysql_error(je->mysql));
+        g_warning("Could not fully retrieve results from %s: %s", je->server,
+                  mysql_error(je->mysql));
         free_job(je);
         return FALSE;
       }
@@ -608,8 +672,8 @@ gboolean run_query_async_cb(GIOChannel *source, GIOCondition cond,
     if (ret != NET_ASYNC_COMPLETE)
       return park(je);
     if (db_error > 0) {
-      g_critical("Could not execute statement on %s: %s", je->server,
-                 mysql_error(je->mysql));
+      g_warning("Could not execute statement on %s: %s", je->server,
+                mysql_error(je->mysql));
     } else if (db_error == 0) {
       je->state = JOB_FETCHING_RESULT;
       return park(je);
@@ -640,7 +704,16 @@ gboolean park(struct job_entry *je) {
     break;
   }
 
-  g_event_pool_wait((GIOFunc)run_query_async_cb, je->channel, cond, je);
+  int timeout;
+
+  if (je->state == JOB_CONNECTING && connect_timeout)
+    timeout = connect_timeout;
+  else
+    timeout = read_timeout;
+
+  flush_buffers();
+  g_event_pool_timed_wait((GIOFunc)run_query_async_cb, je->channel, cond, je,
+                          timeout);
   return FALSE;
 }
 
@@ -665,7 +738,8 @@ int run_query_async_init(GIOChannel *src, GIOCondition cond, gpointer data) {
   int ret = mysql_real_connect_nonblocking_run(je->mysql, &db_error);
   int fd = mysql_get_file_descriptor(je->mysql);
   if (fd == -1) {
-    g_critical("%s", mysql_error(je->mysql));
+    g_warning("Could not connect to %s: %s", je->server,
+              mysql_error(je->mysql));
     free_job(je);
     return FALSE;
   }
@@ -673,7 +747,8 @@ int run_query_async_init(GIOChannel *src, GIOCondition cond, gpointer data) {
 
   if (ret == NET_ASYNC_COMPLETE) {
     if (db_error) {
-      g_critical("%s", mysql_error(je->mysql));
+      g_warning("Could not connect to %s: %s", je->server,
+                mysql_error(je->mysql));
       free_job(je);
       return FALSE;
     }
@@ -748,6 +823,7 @@ gboolean str_in_array(const char *string, const char **array) {
   return (FALSE);
 }
 
+/* Initialize MySQL structure with its options for the job */
 static void job_mysql_init(struct job_entry *je) {
   MYSQL *mysql = je->mysql = mysql_init(NULL);
 
