@@ -73,6 +73,8 @@ char* serversfile = NULL;
 int default_num_threads = 200;
 int num_threads = 0;
 
+int unbuffered = 0;
+
 #define CONNECT_TIMEOUT 2
 
 #define MAXLINE (1 << 20)
@@ -248,6 +250,13 @@ static GOptionEntry entries[] = {
      NULL},
     {"ssl-key", 0, 0, G_OPTION_ARG_STRING, &ssl_key, "Private key file", NULL},
     {"ssl-cert", 0, 0, G_OPTION_ARG_STRING, &ssl_cert, "Public key file", NULL},
+    {"unbuffered",
+     'U',
+     0,
+     G_OPTION_ARG_NONE,
+     &unbuffered,
+     "Don't buffer output",
+     NULL},
     {NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL}};
 
 typedef enum {
@@ -430,12 +439,10 @@ void flush_g_string(GString* data, gboolean force) {
   if (!data->len)
     return;
 
-  if (force || data->len > 16368) {
-    g_mutex_lock(&write_mutex);
-  } else if (!g_mutex_trylock(&write_mutex)) {
+  if (!force && !unbuffered && data->len < 16384)
     return;
-  }
 
+  g_mutex_lock(&write_mutex);
   write_g_string_locked(data);
   g_string_set_size(data, 0);
   g_mutex_unlock(&write_mutex);
@@ -761,7 +768,7 @@ gboolean run_query_async_cb(
       }
 
     case JOB_FETCHING_RESULT:
-
+    fetching_result:
       je->result = mysql_use_result(je->mysql);
       if (!je->result) {
         if (mysql_field_count(je->mysql) != 0) {
@@ -816,7 +823,7 @@ gboolean run_query_async_cb(
             mysql_error(je->mysql));
       } else if (db_error == 0) {
         je->state = JOB_FETCHING_RESULT;
-        return park(je);
+        goto fetching_result;
       }
     default:
       if (je->dblist) {
