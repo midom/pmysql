@@ -53,7 +53,7 @@ void g_event_pool_wait(
     GIOCondition condition,
     gpointer data) {
   GSource* source = g_io_create_watch(channel, condition);
-  g_source_set_callback(source, (GSourceFunc)func, data, NULL);
+  g_source_set_callback(source, G_SOURCE_FUNC(func), data, NULL);
   g_source_attach(source, g_main_context_get_thread_default());
   g_source_unref(source);
 }
@@ -92,10 +92,10 @@ void g_event_pool_timed_wait(
   wrapper->user_data = data;
 
   g_source_set_callback(
-      wrapper->poll_source, (GSourceFunc)g_event_pool_cb, wrapper, NULL);
+      wrapper->poll_source, G_SOURCE_FUNC(g_event_pool_cb), wrapper, NULL);
   g_source_set_callback(
       wrapper->time_source,
-      (GSourceFunc)g_event_pool_timeout_cb,
+      G_SOURCE_FUNC(g_event_pool_timeout_cb),
       wrapper,
       NULL);
 
@@ -133,7 +133,7 @@ void g_event_pool_runner(struct GEventPoolRunner* runner) {
 
   GSource* source = g_io_create_watch(channel, G_IO_IN);
   g_source_set_callback(
-      source, (GSourceFunc)g_event_pool_queue_task, pool, NULL);
+      source, G_SOURCE_FUNC(g_event_pool_queue_task), pool, NULL);
   g_source_attach(source, context);
 
   /* We loop when we're:
@@ -194,7 +194,7 @@ GEventPool* g_event_pool_new(
     runner->pool = pool;
     runner->context = g_main_context_new();
     runner->thread =
-        g_thread_new(NULL, (GThreadFunc)g_event_pool_runner, runner);
+        g_thread_new(NULL, (GThreadFunc)(void(*)(void))g_event_pool_runner, runner);
     pool->threads[i] = runner;
   }
   return pool;
