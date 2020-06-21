@@ -45,5 +45,5 @@ void g_event_pool_timed_wait(
 void g_event_pool_shutdown(GEventPool*, gboolean);
 
 #ifndef GLIB_VERSION_2_58
-#define G_SOURCE_FUNC(f) ((GSourceFunc) (void (*)(void)) (f))
+#define G_SOURCE_FUNC(f) ((GSourceFunc)(void (*)(void))(f))
 #endif

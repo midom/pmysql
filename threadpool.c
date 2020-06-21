@@ -193,8 +193,8 @@ GEventPool* g_event_pool_new(
     struct GEventPoolRunner* runner = g_new0(struct GEventPoolRunner, 1);
     runner->pool = pool;
     runner->context = g_main_context_new();
-    runner->thread =
-        g_thread_new(NULL, (GThreadFunc)(void(*)(void))g_event_pool_runner, runner);
+    runner->thread = g_thread_new(
+        NULL, (GThreadFunc)(void (*)(void))g_event_pool_runner, runner);
     pool->threads[i] = runner;
   }
   return pool;
