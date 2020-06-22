@@ -10,3 +10,6 @@ pmysql: pmysql.o threadpool.o
 
 clean:
 	rm -f pmysql *.o
+
+format:
+	clang-format -i *.[ch]

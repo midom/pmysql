@@ -32,11 +32,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+#if defined MYSQL_VERSION_ID && MYSQL_VERSION_ID > 80016
 #ifndef PMYSQL_ASYNC
 #define PMYSQL_ASYNC
 #endif
+#include "mysql_async.h"
 #include "threadpool.h"
+
 #endif
 
 #ifndef GLIB_VERSION_2_32
@@ -596,10 +598,11 @@ gboolean run_query_async_cb(
     GIOChannel* source,
     GIOCondition cond,
     struct job_entry* je) {
-  int db_error;
-  int ret;
+  enum net_async_status ret;
 
   MYSQL_ROW row;
+
+  g_message("Well hello, %d %d", cond, je->state);
 
   // Timeouts!
   if (!source && cond == (G_IO_ERR | G_IO_HUP)) {
@@ -639,11 +642,14 @@ gboolean run_query_async_cb(
     case JOB_CONNECTING:
       je->state = JOB_CONNECTING;
 
-      ret = mysql_real_connect_nonblocking_run(je->mysql, &db_error);
-      if (ret != NET_ASYNC_COMPLETE)
+      ret = mysql_real_connect_nonblocking(
+          je->mysql, NULL, NULL, NULL, NULL, 0, NULL, 0);
+
+      g_message("Connecting, %d", ret);
+      if (ret == NET_ASYNC_NOT_READY)
         return park(je);
 
-      if (db_error) {
+      if (ret == NET_ASYNC_ERROR) {
         g_warning(
             "Could not connect to %s: %s", je->server, mysql_error(je->mysql));
         free_job(je);
@@ -654,6 +660,7 @@ gboolean run_query_async_cb(
       je->state = JOB_CONNECTED;
       je->start_time = g_get_monotonic_time();
 
+#ifdef FACEBOOK_MYSQL
       /* First connected session will store its SSL context globally,
        * there will be other ones in flight that will have their own,
        * but no more than there're workers */
@@ -663,16 +670,16 @@ gboolean run_query_async_cb(
         ssl_ctx = mysql_take_ssl_context_ownership(je->mysql);
         g_once_init_leave(&ssl_ctx_init, 1);
       }
+#endif
     case JOB_LIST_DATABASES:
       je->state = JOB_LIST_DATABASES;
       if (all_databases) {
         char* query = "SHOW DATABASES";
-        ret = mysql_real_query_nonblocking(
-            je->mysql, query, strlen(query), &db_error);
-        if (ret != NET_ASYNC_COMPLETE)
+        ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query));
+        if (ret == NET_ASYNC_NOT_READY)
           return park(je);
 
-        if (db_error) {
+        if (ret == NET_ASYNC_ERROR) {
           g_warning(
               "Could not list databases on %s: %s",
               je->server,
@@ -733,14 +740,14 @@ gboolean run_query_async_cb(
         }
 
         char* query = g_strdup_printf("USE `%s`", je->in_db);
-        ret = mysql_real_query_nonblocking(
-            je->mysql, query, strlen(query), &db_error);
+        ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query));
         free(query);
+
         if (ret == NET_ASYNC_NOT_READY) {
           return park(je);
         }
 
-        if (db_error && mysql_errno(je->mysql)) {
+        if (ret == NET_ASYNC_ERROR) {
           g_warning(
               "Could not select database on %s: %s",
               je->server,
@@ -753,12 +760,11 @@ gboolean run_query_async_cb(
     case JOB_QUERY:
       je->state = JOB_QUERY;
       char* query = je->query ? je->query : the_query;
-      ret = mysql_real_query_nonblocking(
-          je->mysql, query, strlen(query), &db_error);
-      if (ret != NET_ASYNC_COMPLETE)
+      ret = mysql_real_query_nonblocking(je->mysql, query, strlen(query));
+      if (ret == NET_ASYNC_NOT_READY)
         return park(je);
 
-      if (db_error) {
+      if (ret == NET_ASYNC_ERROR) {
         g_warning(
             "Could not execute query on %s: %s",
             je->server,
@@ -785,13 +791,13 @@ gboolean run_query_async_cb(
       je->state = JOB_FETCHING_ROWS;
       while (je->result) {
         ret = mysql_fetch_row_nonblocking(je->result, &row);
-        if (ret != NET_ASYNC_COMPLETE)
+        if (ret == NET_ASYNC_NOT_READY)
           return park(je);
 
         if (row)
           print_row(je, row);
 
-        if (mysql_errno(je->mysql)) {
+        if (ret == NET_ASYNC_ERROR) {
           g_warning(
               "Could not fully retrieve results from %s: %s",
               je->server,
@@ -813,18 +819,21 @@ gboolean run_query_async_cb(
 
     case JOB_NEXT_RESULT:
       je->state = JOB_NEXT_RESULT;
-      ret = mysql_next_result_nonblocking(je->mysql, &db_error);
-      if (ret != NET_ASYNC_COMPLETE)
+      ret = mysql_next_result_nonblocking(je->mysql);
+      if (ret == NET_ASYNC_NOT_READY)
         return park(je);
-      if (db_error > 0) {
+      if (ret == NET_ASYNC_ERROR) {
         g_warning(
             "Could not execute statement on %s: %s",
             je->server,
             mysql_error(je->mysql));
-      } else if (db_error == 0) {
+      }
+      if (ret == NET_ASYNC_COMPLETE) {
         je->state = JOB_FETCHING_RESULT;
         goto fetching_result;
       }
+      /* Remaining is NET_ASYNC_COMPLETE_NO_MORE_RESULTS, which should fall
+       * through */
     default:
       if (je->dblist) {
         free(je->in_db);
@@ -838,15 +847,22 @@ gboolean run_query_async_cb(
 
 gboolean park(struct job_entry* je) {
   GIOCondition cond;
-  switch (je->mysql->net.async_blocking_state) {
+  NET_ASYNC* net_async = NET_ASYNC_DATA(&je->mysql->net);
+  enum net_async_block_state async_blocking_state =
+      net_async ? net_async->async_blocking_state : NET_NONBLOCKING_CONNECT;
+
+  switch (async_blocking_state) {
     case NET_NONBLOCKING_WRITE:
+	g_message("Will write");
       cond = G_IO_OUT;
       break;
     case NET_NONBLOCKING_READ:
+      g_message("Will read");
       cond = G_IO_IN;
       break;
     default:
       // Need to be sure connection is writable, if it is not waiting
+	g_message("Will write");
       cond = G_IO_OUT;
       break;
   }
@@ -864,12 +880,31 @@ gboolean park(struct job_entry* je) {
   return FALSE;
 }
 
+#ifndef FACEBOOK_MYSQL
+/* THIS IS HORRIBLE HORRIBLE HACK. See https://bugs.mysql.com/bug.php?id=99805
+ */
+struct MYSQL_SOCKET {
+  /** The real socket descriptor. */
+  my_socket fd;
+};
+
+struct Vio {
+  struct MYSQL_SOCKET mysql_socket;
+};
+
+int mysql_get_socket_descriptor(MYSQL* mysql) {
+  if (mysql && mysql->net.vio) {
+    return mysql->net.vio->mysql_socket.fd;
+  }
+  return -1;
+}
+#endif
+
 int run_query_async_init(GIOChannel* src, GIOCondition cond, gpointer data) {
   g_assert(!src);
   g_assert(!cond);
 
   struct job_entry* je = data;
-  int db_error;
 
   je->state = JOB_INIT;
   job_mysql_init(je);
@@ -877,7 +912,7 @@ int run_query_async_init(GIOChannel* src, GIOCondition cond, gpointer data) {
   int client_flags = CLIENT_MULTI_STATEMENTS; // XXX: flags
   if (should_compress)
     client_flags |= CLIENT_COMPRESS;
-  mysql_real_connect_nonblocking_init(
+  enum net_async_status ret = mysql_real_connect_nonblocking(
       je->mysql,
       je->host,
       username,
@@ -888,8 +923,7 @@ int run_query_async_init(GIOChannel* src, GIOCondition cond, gpointer data) {
       client_flags);
 
   je->state = JOB_CONNECTING;
-  int ret = mysql_real_connect_nonblocking_run(je->mysql, &db_error);
-  int fd = mysql_get_file_descriptor(je->mysql);
+  int fd = mysql_get_socket_descriptor(je->mysql);
   if (fd == -1) {
     g_warning(
         "Could not connect to %s: %s", je->server, mysql_error(je->mysql));
@@ -898,13 +932,19 @@ int run_query_async_init(GIOChannel* src, GIOCondition cond, gpointer data) {
   }
   je->channel = g_io_channel_unix_new(fd);
 
+  if (ret == NET_ASYNC_ERROR) {
+    g_warning(
+        "Could not connect to %s: %s", je->server, mysql_error(je->mysql));
+    free_job(je);
+    return FALSE;
+  }
+
+  if (ret == NET_ASYNC_NOT_READY) {
+	  return park(je);
+  }
+
   if (ret == NET_ASYNC_COMPLETE) {
-    if (db_error) {
-      g_warning(
-          "Could not connect to %s: %s", je->server, mysql_error(je->mysql));
-      free_job(je);
-      return FALSE;
-    }
+	  g_message("CONNECTED!");
     je->state = JOB_CONNECTED;
   }
   return park(je);
@@ -993,7 +1033,7 @@ static void job_mysql_init(struct job_entry* je) {
   mysql_options(
       mysql, MYSQL_OPT_CONNECT_TIMEOUT, (const char*)&connect_timeout);
 
-#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+#ifdef FACEBOOK_MYSQL
   if (ssl_ctx)
     mysql_options(mysql, MYSQL_OPT_SSL_CONTEXT, ssl_ctx);
 #endif
@@ -1031,7 +1071,7 @@ static void run_job(struct job_entry* je) {
     goto cleanup;
   }
 
-#ifdef HAVE_MYSQL_NONBLOCKING_CLIENT
+#ifdef FACEBOOK_MYSQL
   static gsize ssl_ctx_init;
   if (g_once_init_enter(&ssl_ctx_init)) {
     ssl_ctx = mysql_take_ssl_context_ownership(je->mysql);
