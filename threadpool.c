@@ -58,21 +58,34 @@ void g_event_pool_wait(
   g_source_unref(source);
 }
 
+/* Both sources are one-shot: whichever fires first tears down its twin and
+ * drops the wrapper. The callback is invoked only after the wrapper is gone,
+ * because it is free to re-arm the job (allocating a fresh wrapper), and its
+ * return value is deliberately ignored - keeping the source alive would leave
+ * glib holding a pointer to freed user data. */
 gboolean g_event_pool_timeout_cb(GEventPoolTimeoutWrapper* wrapper) {
+  GIOFunc func = wrapper->func;
+  gpointer user_data = wrapper->user_data;
+
   g_source_destroy(wrapper->poll_source);
-  gboolean ret = wrapper->func(NULL, G_IO_ERR | G_IO_HUP, wrapper->user_data);
   g_free(wrapper);
-  return ret;
+
+  func(NULL, G_IO_ERR | G_IO_HUP, user_data);
+  return G_SOURCE_REMOVE;
 }
 
 gboolean g_event_pool_cb(
     GIOChannel* source,
     GIOCondition cond,
     GEventPoolTimeoutWrapper* wrapper) {
+  GIOFunc func = wrapper->func;
+  gpointer user_data = wrapper->user_data;
+
   g_source_destroy(wrapper->time_source);
-  gboolean ret = wrapper->func(source, cond, wrapper->user_data);
   g_free(wrapper);
-  return ret;
+
+  func(source, cond, user_data);
+  return G_SOURCE_REMOVE;
 }
 
 void g_event_pool_timed_wait(
