@@ -32,7 +32,7 @@ struct GEventPool {
   int num_threads;
 };
 
-typedef struct GEventPool GEventPool;
+// typedef struct GEventPool GEventPool;
 gboolean g_event_pool_push(GEventPool*, void*);
 GEventPool* g_event_pool_new(GIOFunc, gpointer, gint, GError**);
 void g_event_pool_wait(GIOFunc, GIOChannel*, GIOCondition, gpointer);
